@@ -1,0 +1,362 @@
+#!/usr/bin/env luajit
+
+local lpeg = require('lpeg')
+local compiler = require('compiler')
+
+local srcname = arg[1]
+if not srcname then
+   print("usage :"..arg[0].." <script>")
+   os.exit(0)
+end
+local srcfile = assert(io.open(srcname))
+
+local src = srcfile:read('*a')
+srcfile:close()
+
+local lua  = compiler.compile(src, '@'..srcname)
+--print(lua)
+local main = assert(loadstring(lua, '='..srcname)) -- TODO: src map
+
+local function new(c, ...)
+   if c.new then
+      return c:new(...)
+   else
+      local o = { }
+      setmetatable(o, c)
+      if o.constructor then
+         local r = o.constructor(o, ...)
+         if r ~= nil then
+            return r
+         end
+      end
+      return o
+   end
+end
+
+local function instanceof(a, b)
+   return a.constructor == b.__methods__.constructor
+end
+
+
+local Class = { }
+function Class.__call(class, ...)
+   return class.__methods__.constructor(...)
+end
+local function class(name, base, body)
+   local class = { __name__ = name }
+   class.__methods__ = setmetatable({ }, { __index = base.__methods__ })
+   class.__getters__ = setmetatable({ }, { __index = base.__getters__ })
+   class.__setters__ = setmetatable({ }, { __index = base.__setters__ })
+
+   function class.__index(o, k)
+      if class.__getters__[k] then
+         return class.__getters__[k](o)
+      end
+      return class.__methods__[k]
+   end
+   function class.__newindex(o, k, v)
+      if class.__setters__[k] then
+         class.__setters__[k](o, v)
+      else
+         rawset(o, k, v)
+      end
+   end
+   function class.__tostring(o)
+      if o.toString then
+         return o:toString()
+      else
+         return string.format('<%s>:%p', name, o)
+      end
+   end
+   body(setmetatable({ }, class), base)
+   return class
+end
+
+local FuncitonMeta = { }
+local FunctionData = { }
+function FunctionData:__index(func)
+   local obj = setmetatable({ }, Object)
+   rawset(self, func, obj)
+   return obj
+end
+debug.setmetatable(function() end, FuncitonMeta)
+
+local Object = { }
+Object.__methods__ = { }
+Object.__methods__.constructor = function()
+   return Object:create({ }, { })
+end
+function Object:defineProperties(obj, props)
+   local m = getmetatable(obj)
+   for k, d in pairs(props) do
+      if d.get then
+         m.__getters__[k] = d.get
+      elseif d.set then
+         m.__setters__[k] = d.set
+      elseif type(d.value) == 'function' then
+         if d.static then
+            rawset(m, k, d.value)
+         else
+            m.__methods__[k] = d.value
+         end
+      else
+         rawset(obj, k, d.value)
+      end
+   end
+   return obj 
+end
+function Object:create(proto, props)
+   local m = { }
+   m.__getters__ = { }
+   m.__setters__ = { }
+   function m.__index(o, k)
+      if m.__getters__[k] then
+         return m.__getters__[k](o)
+      elseif proto then
+         return proto[k]
+      end
+      return nil
+   end
+   function m.__newindex(o, k, v)
+      if m.__setters__[k] then
+         m.__setters__[k](o, v)
+      else
+         rawset(o, k, v)
+      end
+   end
+   function m.__tostring(o)
+      if o.toString then
+         return o:toString()
+      else
+         return string.format('<Object>:%p', o)
+      end
+   end
+
+   local o = { }
+   for k, d in pairs(props) do
+      if d.get then
+         m.__getters__[k] = d.get
+      elseif d.set then
+         m.__setters__[k] = d.set
+      else
+         o[k] = d.value
+      end
+   end
+   return setmetatable(o, m)
+end
+
+local Array = { }
+Array.__methods__ = { }
+function Array:new(...)
+   return setmetatable({
+      length = select('#', ...), [0] = select(1, ...), select(2, ...)
+   }, self)
+end
+function Array.__methods__:constructor() end
+function Array.__pairs(a)
+   local l = a.length
+   return function(a, p)
+      local i = p + 1
+      local v = a[i]
+      if i < l then
+         return i, v
+      end
+   end, a, -1
+end
+function Array.__methods__:join(sep)
+   return table.concat({ Array.__spread(self) }, sep)
+end
+function Array.__spread(a)
+   return unpack(a, 0, a.length - 1)
+end
+function Array.__len(a)
+   return a.length
+end
+function Array.__tostring(a)
+   if a.toString then
+      return a:toString()
+   end
+   return string.format("[Array: %p]", this)
+end
+function Array.__index(a, k)
+   if Array.__methods__[k] then
+      return Array.__methods__[k]
+   end
+   return nil
+end
+function Array.__newindex(a, i, v)
+   if type(i) == 'number' and i >= a.length then
+      a.length = i + 1
+   end
+   rawset(a, i, v)
+end
+function Array.__methods__:toString()
+   local b = { }
+   for i=0, self.length - 1 do
+      b[#b + 1] = tostring(self[i])
+   end
+   return table.concat(b, ', ')
+end
+
+local function try(try, catch, finally)
+   local ok, rv = xpcall(try, catch)
+   if finally then finally() end
+   return rv
+end
+
+local Name = class("Name", Object, function(this, super)
+   Object:defineProperties(this, {
+      constructor = {
+         value = function(this, symbol)
+            this.symbol = symbol
+         end
+      },
+      toString = {
+         value = function(this)
+            return '@'..this.symbol
+         end
+      }
+   })
+end)
+
+local String = class("String", Object, function(this, super)
+   Object:defineProperties(this, {
+      constructor = {
+         value = function(this, that)
+            return tostring(that)
+         end
+      },
+      match = {
+         value = function(this, regex)
+            local capt = new(Array)
+            while true do
+               local result = regex:exec(this)
+               if result == nil then
+                  break
+               end
+               capt[capt.length] = result[1]
+            end
+            if capt.length > 0 then
+               return capt
+            else
+               return nil
+            end
+         end
+      },
+      toString = {
+         value = function(this)
+            return this
+         end
+      }
+   })
+end)
+debug.setmetatable("", String)
+
+local RegExp = class("RegExp", Object, function(this, super)
+   local pcre = require('pcre')
+
+   Object:defineProperties(this, {
+      constructor = {
+         value = function(this, source, flags)
+            this.index = 0
+            this.input = ''
+            this.source  = source
+            local opts = 0
+            if string.find(flags, 'i') then
+               opts = opts + pcre.lib.PCRE_CASELESS
+               this.ignoreCase = true
+            end
+            if string.find(flags, 'm') then
+               opts = opts + pcre.lib.PCRE_MULTILINE
+               this.multiLine = true
+            end
+            this.pattern = assert(pcre.compile(source, opts))
+            if string.find(flags, 'g') then
+               this.global = true
+            end
+         end
+      },
+      exec = {
+         value = function(this, str)
+            if this.input ~= str then
+               this.input = str
+               this.index = 0
+            end
+            local result = pcre.execute(this.pattern, this.input, this.index)
+            if type(result) == 'table' then
+               this.index = this.index + #result[1] + 1
+               return result
+            elseif result == pcre.lib.PCRE_ERROR_NOMATCH then
+               return nil
+            else
+               error(result, 2)
+            end
+         end
+      },
+      test = {
+         value = function(this, str)
+            local result = pcre.execute(this.pattern, str)
+            if type(result) == 'table' then
+               return true
+            else
+               return false
+            end
+         end
+      },
+      toString = {
+         value = function(this)
+            return this.source
+         end
+      }
+   })
+end)
+
+local Error = class("Error", Object, function(this, super)
+   Object:defineProperties(this, {
+      constructor = {
+         value = function(this, mesg)
+            this.message = mesg
+            this.trace = debug.traceback(mesg, 2)
+         end
+      },
+      toString = {
+         value = function(this)
+            return this.message
+         end
+      }
+   })
+end)
+
+local console = { }
+function console:log(...)
+   print(...)
+end
+local function spread(o)
+   local m = getmetatable(o)
+   if m and m.__spread then
+      return m.__spread(o)
+   end
+   return unpack(o)
+end
+setfenv(main, setmetatable({
+   new = new;
+   try = try;
+   throw = error;
+   Object = Object;
+   Array  = Array;
+   Error  = Error;
+   RegExp = RegExp;
+   class  = class;
+   __spread__ = spread;
+   console = console;
+   assert  = function(_, ...) return assert(...) end;
+   print   = function(_, ...) print(...) end;
+   instanceof = instanceof;
+   __toString__ = function(o)
+      local m = getmetatable(o)
+      local n = m.__name__ or type(o)
+      return string.format('<%s>:%p', n, o)
+   end
+}, { __index = _G }))
+
+main()
