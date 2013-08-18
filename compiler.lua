@@ -5,9 +5,9 @@ local util        = require('util')
 
 local function compile(src, name)
    local srctree = parser.parse(src)
-   print("SRC:", util.dump(srctree))
+   --print("SRC:", util.dump(srctree))
    local dsttree = transformer.transform(srctree, src)
-   print("DST:", util.dump(dsttree))
+   --print("DST:", util.dump(dsttree))
    local luacode = generator.generate(dsttree, name)
    --print("LUA:", luacode)
 

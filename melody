@@ -351,6 +351,7 @@ setfenv(main, setmetatable({
    console = console;
    assert  = function(_, ...) return assert(...) end;
    print   = function(_, ...) print(...) end;
+   _pairs  = function(_, ...) pairs(...) end;
    instanceof = instanceof;
    __toString__ = function(o)
       local m = getmetatable(o)
