@@ -144,7 +144,11 @@ local patt = [[
    )
 
    var_decl <- (
-      "var" <idsafe> s <patt> (s "=" s <expr>)?
+      "var" <idsafe> <var_decl_item> (s "," s <var_decl_item>)*
+   )
+
+   var_decl_item <- (
+       s <patt> (s "=" s <expr>)?
    ) -> varDecl
 
    patt <- (
