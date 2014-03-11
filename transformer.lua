@@ -426,6 +426,13 @@ function match:NewExpression(node)
       self:get(node.callee), unpack(self:list(node.arguments))
    })
 end
+function match:WhileStatement(node)
+   local body = self:get(node.body)
+
+   local test= self:get(node.test)
+
+   return B.whileStatement(test, body)
+end
 function match:ForStatement(node)
    local body = self:get(node.body)
    if node.post[1] then
