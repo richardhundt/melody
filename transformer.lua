@@ -578,33 +578,12 @@ function match:ComprehensionBlock(node)
    return B.forInStatement(B.forNames{ none, left }, iter, B.blockStatement(body))
 end
 
-local function countln(src, pos, idx)
-   local line = 0
-   local index, limit = idx or 1, pos
-   while index <= limit do
-      local s, e = string.find(src, "\n", index, true)
-      if s == nil or e > limit then
-         break
-      end
-      index = e + 1
-      line  = line + 1
-   end
-   return line 
-end
-
 local function transform(tree, src)
    local self = { }
    self.line = 0
-   self.pos  = 0
 
    function self:sync(node)
-      local pos = node.pos
-      if pos ~= nil and pos > self.pos then
-         local prev = self.pos
-         local line = countln(src, pos, prev + 1) + self.line
-         self.line = line
-         self.pos = pos
-      end
+      -- noop for now, line info needs to be fixed in the parser
    end
 
    function self:get(node)

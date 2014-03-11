@@ -205,8 +205,8 @@ function defs.propDefn(k, n, h, b)
       type = "PropertyDefinition", kind = k, key = n, value = defs.funcExpr(h, b)
    }
 end
-function defs.exprStmt(pos, expr)
-   return { type = "ExpressionStatement", expression = expr, pos = pos }
+function defs.exprStmt(expr)
+   return { type = "ExpressionStatement", expression = expr }
 end
 function defs.thisExpr()
    return { type = "ThisExpression" }

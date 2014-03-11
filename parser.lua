@@ -282,7 +282,7 @@ local patt = [[
    ) -> superExpr
 
    expr_stmt <- (
-      {} (<assign_expr> / !("{" / ("class" / "function")<idsafe>) <expr>)
+      (<assign_expr> / !("{" / ("class" / "function")<idsafe>) <expr>)
    ) -> exprStmt
 
    binop <- {
