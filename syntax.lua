@@ -16,6 +16,17 @@ local syntax = {
       abstract = true,
    },
 
+   Fragment = {
+      kind = "Fragment",
+      base = "Statement",
+      properties = {
+         body = {
+            type = "list",
+            kind = "Statement"
+         }
+      }
+   },
+
    Chunk = {
       kind = "Chunk",
       base = "Node",
@@ -186,7 +197,7 @@ local syntax = {
       base = "Expression",
       properties = {
          value = {
-            type = { "string", "number", "nil", "boolean" }
+            type = { "string", "number", "nil", "boolean", "cdata" }
          }
       }
    },
@@ -194,7 +205,7 @@ local syntax = {
       kind = "Table",
       base = "Expression",
       properties = {
-         value = {
+         entries = {
             type = "table"
          }
       }
@@ -205,7 +216,7 @@ local syntax = {
       properties = {
          expression = {
             type = "node",
-            kind = {"Statement", "Expression" }
+            kind = { "Statement", "Expression" }
          }
       }
    },
@@ -512,7 +523,7 @@ local function validate_enum(spec, prop)
          return true, prop
       end
    end
-   return nil, "expected one of "..kind2str(spec.kind)
+   return nil, "expected one of "..kind2str(spec.values).." (got '"..tostring(prop).."')"
 end
 
 local function validate_type(spec, prop)
@@ -555,6 +566,7 @@ local function validate(meta, node)
       else
          local ok, er = validate_any(spec, prop)
          if not ok then
+            print(util.dump(node))
             error(er.." for "..(node.kind or "?").."."..name)
          end
       end
@@ -572,3 +584,4 @@ return {
    syntax = syntax,
    build  = build,
 }
+

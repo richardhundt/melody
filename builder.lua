@@ -1,10 +1,11 @@
+
 local exports = { }
 
 local util   = require('util')
 local syntax = require("syntax")
 
-function exports.tempnam()
-   return exports.identifier(util.genid())
+function exports.tempid(prefix, loc)
+   return exports.identifier(util.genid(prefix), loc)
 end
 function exports.chunk(body, loc)
    return syntax.build("Chunk", { body = body, loc = loc })
@@ -64,8 +65,11 @@ end
 function exports.literal(val, loc)
    return syntax.build("Literal", { value = val, loc = loc })
 end
-function exports.table(val, loc)
-   return syntax.build("Table", { value = val, loc = loc })
+function exports.table(entries, loc)
+   return syntax.build("Table", { entries = entries, loc = loc })
+end
+function exports.tableEntry(key, value)
+   return syntax.build("TableEntry", { key = key, value = value })
 end
 function exports.expressionStatement(expr, loc)
    return syntax.build("ExpressionStatement", { expression = expr, loc = loc })
@@ -75,6 +79,9 @@ function exports.emptyStatement(loc)
 end
 function exports.blockStatement(body, loc)
    return syntax.build("BlockStatement", { body = body, loc = loc })
+end
+function exports.fragment(body, loc)
+   return syntax.build("Fragment", { body = body, loc = loc })
 end
 function exports.doStatement(body, loc)
    return syntax.build("DoStatement", { body = body, loc = loc })

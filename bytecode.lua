@@ -2,7 +2,7 @@
  dump   = header proto+ 0U
  header = ESC 'L' 'J' versionB flagsU [namelenU nameB*]
  proto  = lengthU pdata
- pdata  = phead bcinsW* kgc* knum* uvdataH* [debugB*]
+ pdata  = phead bcinsW* uvdataH* kgc* knum* [debugB*]
  phead  = flagsB numparamsB framesizeB numuvB numkgcU numknU numbcU
           [debuglenU [firstlineU numlineU]]
  kgc    = kgctypeU { ktab | (loU hiU) | (rloU rhiU iloU ihiU) | strB* }
@@ -37,8 +37,9 @@ end
 -- forward declarations
 local Buf, Ins, Proto, Dump, KNum, KObj
 
-local MAX_REG = 200
-local MAX_UVS = 60
+local MAX_REG   = 200
+local MAX_UVS   = 60
+local MAX_STACK = 65536 - MAX_UVS
 
 local BC = enum {
    [0] = 'ISLT', 'ISGE', 'ISLE', 'ISGT', 'ISEQV', 'ISNEV', 'ISEQS','ISNES',
@@ -184,16 +185,23 @@ Buf.__index.pack = function(self)
    return ffi.string(self.data, self.offs)
 end
 
-local double_1 = ffi.typeof('double[1]')
-local uint32_1 = ffi.typeof('uint32_t[1]')
-Buf.__index.put_number = function(self, v)
-   local offs = self.offs
-   local numv = double_1(v)
-   local char = ffi.cast('uint8_t*', numv)
+local double_new = ffi.typeof('double[1]')
+local uint32_new = ffi.typeof('uint32_t[1]')
+local int64_new  = ffi.typeof('int64_t[1]')
+local uint64_new = ffi.typeof('uint64_t[1]')
 
-   local u32_lo, u32_hi = uint32_1(0), uint32_1(0)
+local function dword_get_u32(cdata_new, v)
+   local p = cdata_new(v)
+   local char = ffi.cast('uint8_t*', p)
+   local u32_lo, u32_hi = uint32_new(0), uint32_new(0)
    ffi.copy(u32_lo, char, 4)
    ffi.copy(u32_hi, char + 4, 4)
+   return u32_lo, u32_hi
+end
+
+Buf.__index.put_number = function(self, v)
+   local offs = self.offs
+   local u32_lo, u32_hi = dword_get_u32(double_new, v)
 
    self:put_uleb128(1 + 2 * u32_lo[0]) -- 33 bits with lsb set
    if u32_lo[0] >= 0x80000000 then
@@ -245,6 +253,8 @@ function KObj.__index:write(buf)
    local t, v = type(self[1]), self[1]
    if t == "string" then
       self:write_string(buf, v)
+   elseif t == 'cdata' then
+      self:write_kcdata(buf, v)
    elseif t == 'table' then
       if typeof(v) == Proto then
          self:write_proto(buf, v)
@@ -264,6 +274,30 @@ function KObj.__index:write_table(buf, v)
       seen[i] = true
    end
 end
+function KObj.__index:write_kcdata(buf, v)
+   if ffi.istype('double complex', v) then
+      buf:put_uleb128(KOBJ.COMPLEX)
+      local u32_lo, u32_hi = dword_get_u32(double_new, v[0])
+      buf:put_uleb128(u32_lo[0])
+      buf:put_uleb128(u32_hi[0])
+      u32_lo, u32_hi = dword_get_u32(double_new, v[1])
+      buf:put_uleb128(u32_lo[0])
+      buf:put_uleb128(u32_hi[0])
+   elseif ffi.istype('uint64_t', v) then
+      buf:put_uleb128(KOBJ.U64)
+      local u32_lo, u32_hi = dword_get_u32(uint64_new, v)
+      buf:put_uleb128(u32_lo[0])
+      buf:put_uleb128(u32_hi[0])
+   elseif ffi.istype('int64_t', v) then
+      buf:put_uleb128(KOBJ.I64)
+      local u32_lo, u32_hi = dword_get_u32(int64_new, v)
+      buf:put_uleb128(u32_lo[0])
+      buf:put_uleb128(u32_hi[0])
+   else
+      error('Unknown KCDATA : ' .. tostring(v))
+   end
+end
+
 
 KNum = { }
 KNum.__index = { }
@@ -285,8 +319,13 @@ function Proto.new(flags, outer)
    return setmetatable({
       flags  = flags or 0;
       outer  = outer;
+      scope  = {
+         actvars = { };
+         basereg = 0;
+      };
       params = { };
       upvals = { };
+      uvinfo = { };
       code   = { };
       kobj   = { };
       knum   = { };
@@ -295,12 +334,13 @@ function Proto.new(flags, outer)
       labels = { };
       tohere = { };
       kcache = { };
+      lastjmp = 0;
+      freereg = 0;
       varinfo = { };
-      actvars = { };
-      freereg   = 0;
       currline  = 1;
-      firstline = 1;
-      numlines  = 1;
+      lastline  = 1;
+      firstline = math.huge;
+      numlines  = 0;
       framesize = 0;
    }, Proto)
 end
@@ -314,17 +354,59 @@ function Proto.__index:nextreg(num)
    end
    return reg
 end
-function Proto.__index:enter()
-   local outer = self.actvars
-   self.actvars = setmetatable({ }, {
-      freereg = self.freereg;
-      __index = outer;
-   })
+function Proto.__index:nactvars()
+   return self.scope.basereg + #self.scope.actvars
 end
-function Proto.__index:leave()
-   local scope = assert(getmetatable(self.actvars), "cannot leave main scope")
-   self.freereg = scope.freereg
-   self.actvars = scope.__index
+function Proto.__index:enter()
+   local outer = self.scope
+   self.scope = {
+      actvars = { };
+      basereg = self:nactvars();
+      outer   = outer;
+      upval   = false;
+   }
+   return self.scope
+end
+function Proto.__index:leave(base)
+   if self.scope.upval then
+      self:emit(BC.UCLO, base or self.scope.basereg, 0)
+   end
+   for i=1, #self.scope.actvars do
+      self.scope.actvars[i].endpc = #self.code
+   end
+   self.scope = self.scope.outer
+   self.freereg = self:nactvars()
+end
+function Proto.__index:close()
+   if self.firstline == math.huge then
+      -- should probably error
+      self.firstline = 1
+   end
+   self.numlines = self.lastline - self.firstline
+   if #self.code > 0 then
+      for i=1, #self.scope.actvars do
+         self.scope.actvars[i].endpc = #self.code
+      end
+      self.freereg = 0
+      if self.lastjmp > #self.code then
+         if self.scope.upval then
+            self:emit(BC.UCLO, 0, 0)
+            self.scope.upval = nil
+         end
+         self:op_ret0()
+      else
+         local last = self.code[#self.code][1]
+         if last ~= BC.CALLT and last ~= BC.CALLMT
+         and not (last >= BC.RETM and last <= BC.RET1) then
+            if self.scope.upval then
+               self:emit(BC.UCLO, 0, 0)
+            end
+            self:op_ret0()
+         end
+      end
+   else
+      self:op_ret0()
+   end
 end
 function Proto.__index:child(flags)
    self.flags = bit.bor(self.flags, Proto.CHILD)
@@ -349,16 +431,24 @@ function Proto.__index:const(val)
          self.kcache[val] = item
          self.knum[#self.knum + 1] = item
       end
+   elseif type(val) == 'cdata' then
+      local item = KObj.new(val)
+      item.idx = #self.kobj
+      self.kobj[#self.kobj + 1] = item
+      return item.idx
    else
       error("not a const: "..tostring(val))
    end
    return self.kcache[val].idx
 end
 function Proto.__index:line(ln)
-   self.currline = ln
-   if ln > self.currline then
-      self.numlines = ln
+   if ln < self.firstline then
+      self.firstline = ln
    end
+   if ln > self.lastline then
+      self.lastline = ln
+   end
+   self.currline = ln
 end
 function Proto.__index:emit(op, a, b, c)
    --print(("Ins:%s %s %s %s"):format(BC[op], a, b, c))
@@ -368,6 +458,8 @@ function Proto.__index:emit(op, a, b, c)
    return ins
 end
 function Proto.__index:write(buf)
+   self:close() -- fix return and tcall
+
    local has_child
    if bit.band(self.flags, Proto.CHILD) ~= 0 then
       has_child = true
@@ -379,17 +471,7 @@ function Proto.__index:write(buf)
       end
    end
 
-   if self.need_close then
-      self:emit(BC.UCLO, 0, 0) -- close upvals
-   end
-
    local body = Buf.new()
-   local last_inst = self.code[#self.code][1]
-   if not (last_inst >= BC.CALLMT and last_inst <= BC.CALLT) and
-      not (last_inst >= BC.RETM and last_inst <= BC.RET1) then
-      self:emit(BC.RET0, 0, 1)
-   end
-
    self:write_body(body)
 
    local offs = body.offs
@@ -410,7 +492,7 @@ function Proto.__index:write_head(buf, size_debug)
    buf:put(self.flags)
    buf:put(#self.params)
    buf:put(self.framesize)
-   buf:put(#self.upvals)
+   buf:put(#self.uvinfo)
    buf:put_uleb128(#self.kobj)
    buf:put_uleb128(#self.knum)
    buf:put_uleb128(#self.code)
@@ -422,14 +504,9 @@ function Proto.__index:write_body(buf)
    for i=1, #self.code do
       self.code[i]:write(buf)
    end
-   for i=1, #self.upvals do
-      local uval = self.upvals[i]
-      if self.outer == uval.proto then
-         buf:put_uint16(bit.bor(uval.vinfo.idx, 0x8000))
-      else
-         self.outer:upval(uval.vinfo.name)
-         buf:put_uint16(uval.vinfo.idx)
-      end
+   for i=1, #self.uvinfo do
+      local uval = self.uvinfo[i]
+      buf:put_uint16(uval.slot)
    end
    for i=#self.kobj, 1, -1 do
       local o = self.kobj[i]
@@ -461,9 +538,9 @@ function Proto.__index:write_debug(buf)
          buf:put_uint32(delta)
       end
    end
-   for i=1, #self.upvals do
-      local uval = self.upvals[i]
-      buf:put_bytes(uval.vinfo.name.."\0")
+   for i=1, #self.uvinfo do
+      local uval = self.uvinfo[i]
+      buf:put_bytes(uval.name.."\0")
    end
    local lastpc = 0
    for i=1, #self.varinfo do
@@ -475,65 +552,75 @@ function Proto.__index:write_debug(buf)
       lastpc = startpc
    end
 end
-function Proto.__index:newvar(name, reg, ofs)
-   if not reg then reg = self:nextreg() end
-   if not ofs then ofs = #self.code end
-   local var = {
-      idx      = reg;
-      startpc  = ofs;
-      endpc    = ofs;
+function Proto.__index:newvar(name, dest)
+   dest = dest or self:nextreg()
+   local vinfo = {
+      idx      = dest;
+      startpc  = #self.code;
+      endpc    = #self.code;
       name     = name;
    }
-   self.actvars[name] = var
 
-   self.varinfo[name] = var
-   self.varinfo[#self.varinfo + 1] = var
-   return var
+   -- scoped variable info
+   self.scope.actvars[name] = vinfo
+   self.scope.actvars[#self.scope.actvars + 1] = vinfo
+
+   -- for the debug segment only
+   vinfo.vidx = #self.varinfo
+   self.varinfo[#self.varinfo + 1] = vinfo
+
+   return vinfo
 end
-function Proto.__index:lookup(name)
-   if self.actvars[name] then
-      return self.actvars[name], false
-   elseif self.outer then
-      return self.outer:lookup(name), true
+function Proto.__index:lookup(name, seen)
+   local found = nil
+   local proto = self
+   local scope = self.scope
+   while scope do
+      found = scope.actvars[name]
+      if found then
+         break
+      end
+      if scope.outer then
+         scope = scope.outer
+      elseif proto.outer then
+         proto = proto.outer
+         scope = proto.scope
+      else
+         return -- global
+      end
    end
-   return nil
-end
-function Proto.__index:getvar(name)
-   local info = self.actvars[name]
-   if not info then return nil end
-   if not info.startpc then
-      info.startpc = #self.code
+
+   local upval = nil
+   if proto ~= self then
+      scope.upval = true
+      if self.upvals[name] then
+         upval = self.upvals[name]
+      else
+         upval = { name = name }
+         upval.idx = #self.uvinfo
+         self.upvals[name] = upval
+         self.uvinfo[#self.uvinfo + 1] = upval
+
+         if proto == self.outer then
+            upval.slot = bit.bor(found.idx, 0x8000)
+         else
+            upval.slot = self.outer:lookup(name, true).idx
+         end
+      end
+      assert(upval.name == name)
    end
-   info.endpc = #self.code
-   return info.idx
+
+   if seen then
+      return upval
+   else
+      return found, upval
+   end
 end
 function Proto.__index:param(...)
    local var = self:newvar(...)
    var.startpc = 0
    self.params[#self.params + 1] = var
    return var.idx
-end
-function Proto.__index:upval(name)
-   if not self.upvals[name] then
-      local proto, upval, vinfo = self.outer, { }
-      while proto do
-         if proto.varinfo[name] then
-            vinfo = proto.varinfo[name]
-            upval.proto = proto
-            upval.vinfo = vinfo
-            break
-         end
-         proto = proto.outer
-      end
-      if not upval then
-         error("not found upvalue:"..name)
-      end
-      self.upvals[name] = upval
-      upval.idx = #self.upvals
-      self.upvals[#self.upvals + 1] = upval
-      proto.need_close = true
-   end
-   return self.upvals[name].idx
 end
 function Proto.__index:here(name)
    if name == nil then name = util.genid() end
@@ -542,7 +629,14 @@ function Proto.__index:here(name)
       local back = self.tohere[name]
       for i=1, #back do
          local offs = back[i]
-         self.code[offs][3] = #self.code - offs
+         local dest = #self.code - offs
+         if self.code[offs][1] == BC.JMP then
+            self.code[offs][2] = self.freereg
+         end
+         self.code[offs][3] = dest
+         if self.lastjmp < dest + offs + 1 then
+            self.lastjmp = dest + offs + 1
+         end
       end
       self.tohere[name] = nil
    else
@@ -551,51 +645,53 @@ function Proto.__index:here(name)
    end
    return name
 end
-function Proto.__index:jump(name)
+function Proto.__index:label(name)
+   local here = self.tohere[name]
+   if not here then
+      here = { }
+      self.tohere[name] = here
+   end
+   here[#here + 1] = #self.code + 1
+end
+function Proto.__index:jump(name, uclo, base)
+   base = base or self.freereg
+   local oper = uclo and BC.UCLO or BC.JMP
+   if uclo then
+      base = self.scope.basereg
+   end
    if self.labels[name] then
       -- backward jump
       local offs = self.labels[name]
-      return self:emit(BC.JMP, self.freereg - 1, offs - #self.code)
+      return self:emit(oper, base, offs - #self.code)
    else
       -- forward jump
-      if type(name) == 'number' then
-         error("bad label")
-      end
-      local here = self.tohere[name]
-      if not here then
-         here = { }
-         self.tohere[name] = here
-      end
-      here[#here + 1] = #self.code + 1
-      return self:emit(BC.JMP, self.freereg - 1, NO_JMP)
+      self:label(name)
+      return self:emit(oper, base, NO_JMP)
    end
 end
 function Proto.__index:loop(name)
    if self.labels[name] then
       -- backward jump
       local offs = self.labels[name]
-      return self:emit(BC.LOOP, self.freereg - 1, offs - #self.code)
+      return self:emit(BC.LOOP, self:nactvars(), offs - #self.code)
    else
       -- forward jump
-      local here = self.tohere[name]
-      if not here then
-         here = { }
-         self.tohere[name] = here
-      end
-      here[#here + 1] = #self.code + 1
-      return self:emit(BC.LOOP, self.freereg - 1, NO_JMP)
+      self:label(name)
+      return self:emit(BC.LOOP, self:nactvars(), NO_JMP)
    end
 end
-function Proto.__index:op_jump(delta)
-   return self:emit(BC.JMP, self.freereg - 1, delta)
+function Proto.__index:op_jump(base, delta)
+   return self:emit(BC.JMP, base or self.freereg, delta)
 end
 function Proto.__index:op_loop(delta)
-   return self:emit(BC.LOOP, self.freereg - 1, delta)
+   return self:emit(BC.LOOP, self:nactvars(), delta)
 end
 
 -- branch if condition
 function Proto.__index:op_test(cond, a, here)
-   return self:emit(cond and BC.IST or BC.ISF, 0, a), self:jump(here)
+   local inst = self:emit(cond and BC.IST or BC.ISF, 0, a)
+   if here then here = self:jump(here) end
+   return inst, here
 end
 -- branch if comparison
 function Proto.__index:op_comp(cond, a, b, here)
@@ -623,7 +719,9 @@ function Proto.__index:op_comp(cond, a, b, here)
          cond = cond..'V'
       end
    end
-   return self:emit(BC['IS'..cond], a, b), self:jump(here)
+   local inst = self:emit(BC['IS'..cond], a, b)
+   if here then here = self:jump(here) end
+   return inst, here
 end
 
 function Proto.__index:op_add(dest, var1, var2)
@@ -642,7 +740,7 @@ function Proto.__index:op_mod(dest, var1, var2)
    return self:emit(BC.MODVV, dest, var1, var2)
 end
 function Proto.__index:op_pow(dest, var1, var2)
-   return self:emit(BC.POWVV, dest, var1, var2)
+   return self:emit(BC.POW, dest, var1, var2)
 end
 function Proto.__index:op_gget(dest, name)
    return self:emit(BC.GGET, dest, self:const(name))
@@ -662,6 +760,13 @@ function Proto.__index:op_len(dest, var1)
 end
 
 function Proto.__index:op_move(dest, from)
+   if from < 0 then
+      print("MOVE:", dest, from)
+      error("from < 0")
+   elseif from > 255 then
+      print("MOVE:", dest, from)
+      error("from > 255")
+   end
    return self:emit(BC.MOV, dest, from)
 end
 function Proto.__index:op_load(dest, val)
@@ -673,11 +778,13 @@ function Proto.__index:op_load(dest, val)
    elseif tv == 'string' then
       return self:emit(BC.KSTR, dest, self:const(val))
    elseif tv == 'number' then
-      if val < 0xffff then
+      if math.floor(val) == val and val < 0x8000 and val >= -0x8000 then
          return self:emit(BC.KSHORT, dest, val)
       else
          return self:emit(BC.KNUM, dest, self:const(val))
       end
+   elseif tv == 'cdata' then
+      return self:emit(BC.KCDATA, dest, self:const(val))
    else
       error("cannot load as constant: "..tostring(val))
    end
@@ -697,18 +804,35 @@ function Proto.__index:op_tnew(dest, narry, nhash)
    else
       nhash = 0
    end
-   return self:emit(BC.TNEW, dest, bit.bor(narry, bit.lshift(nhash, 11)))
+   --return self:emit(BC.TNEW, dest, bit.bor(narry, bit.lshift(nhash, 11)))
+   return self:emit(BC.TNEW, dest, bit.bor(narry, bit.lshift(0, 11)))
 end
 function Proto.__index:op_tget(dest, tab, key)
    if type(key) == 'string' then
-      return self:emit(BC.TGETS, dest, tab, self:const(key))
+      local idx = self:const(key)
+      if idx < 0xff then
+         return self:emit(BC.TGETS, dest, tab, idx)
+      else
+         idx = self:nextreg()
+         self:op_load(idx, key)
+         self.freereg = idx
+         return self:emit(BC.TGETV, dest, tab, idx)
+      end
    else
       return self:emit(BC.TGETV, dest, tab, key)
    end
 end
 function Proto.__index:op_tset(tab, key, val)
    if type(key) == 'string' then
-      return self:emit(BC.TSETS, val, tab, self:const(key))
+      local idx = self:const(key)
+      if idx < 0xff then
+         return self:emit(BC.TSETS, val, tab, idx)
+      else
+         idx = self:nextreg()
+         self:op_load(idx, key)
+         self.freereg = idx
+         return self:emit(BC.TSETV, val, tab, idx)
+      end
    else
       return self:emit(BC.TSETV, val, tab, key)
    end
@@ -724,11 +848,11 @@ end
 function Proto.__index:op_fnew(dest, pidx)
    return self:emit(BC.FNEW, dest, pidx)
 end
-function Proto.__index:op_uclo(jump)
-   return self:emit(BC.UCLO, 0, jump or 0)
+function Proto.__index:op_uclo(base, jump)
+   return self:emit(BC.UCLO, base or self.scope.basereg, jump or 0)
 end
 function Proto.__index:op_uset(name, val)
-   local slot = self:upval(name)
+   local slot = self.upvals[name].idx
    local tv   = type(val)
    if tv == 'string' then
       return self:emit(BC.USETS, slot, self:const(val))
@@ -745,35 +869,28 @@ function Proto.__index:op_uset(name, val)
    end
 end
 function Proto.__index:op_uget(dest, name)
-   local slot = self:upval(name)
+   local slot = self.upvals[name].idx
    return self:emit(BC.UGET, dest, slot)
 end
-function Proto.__index:op_ret(base, rnum)
-   if self.need_close then
-      self:emit(BC.UCLO, 0, 0)
-      self.need_close = nil
+function Proto.__index:is_tcall()
+   if #self.code > 0 then
+      local last = self.code[#self.code][1]
+      if last == BC.CALLT or last == BC.CALLMT then
+         return true
+      end
    end
+   return false
+end
+function Proto.__index:op_ret(base, rnum)
    return self:emit(BC.RET, base, rnum + 1)
 end
 function Proto.__index:op_ret0()
-   if self.need_close then
-      self:emit(BC.UCLO, 0, 0)
-      self.need_close = nil
-   end
    return self:emit(BC.RET0, 0, 1)
 end
 function Proto.__index:op_ret1(base)
-   if self.need_close then
-      self:emit(BC.UCLO, 0, 0)
-      self.need_close = nil
-   end
    return self:emit(BC.RET1, base, 2)
 end
 function Proto.__index:op_retm(base, rnum)
-   if self.need_close then
-      self:emit(BC.UCLO, 0, 0)
-      self.need_close = nil
-   end
    return self:emit(BC.RETM, base, rnum)
 end
 function Proto.__index:op_varg(base, want)
@@ -789,7 +906,7 @@ function Proto.__index:op_callm(base, want, narg)
    return self:emit(BC.CALLM, base, want + 1, narg)
 end
 function Proto.__index:op_callmt(base, narg)
-   return self:emit(BC.CALLMT, base, narg + 1)
+   return self:emit(BC.CALLMT, base, narg)
 end
 function Proto.__index:op_fori(base, stop, step)
    local loop = self:emit(BC.FORI, base, NO_JMP)
@@ -829,7 +946,6 @@ function Dump.new(main, name, flags)
       name  = name;
       flags = flags or 0;
    }, Dump)
-   self.main.need_close = true
    return self
 end
 function Dump.__index:write_header(buf)

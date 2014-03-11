@@ -13,7 +13,7 @@ local function compile(src, name)
 
    local jbc = require("jit.bc")
    local fn = assert(loadstring(luacode))
-   jbc.dump(fn, nil, true)
+   --jbc.dump(fn, nil, true)
 
    return luacode
 end

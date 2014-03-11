@@ -123,8 +123,8 @@ function match:TryStatement(node)
    local oldret = self.retsig
    local oldval = self.retval
 
-   self.retsig = B.tempnam()
-   self.retval = B.tempnam()
+   self.retsig = B.tempid()
+   self.retval = B.tempid()
 
    local try = B.functionExpression({ }, self:get(node.body))
 
@@ -181,7 +181,7 @@ function match:TryStatement(node)
 end
 function match:SwitchStatement(node)
    local body = { }
-   local disc = B.tempnam()
+   local disc = B.tempid()
 
    local cases = { }
    for i=1, #node.cases do
@@ -501,8 +501,8 @@ function match:ObjectExpression(node)
    )
 end
 function match:ForOfStatement(node)
-   local none = B.tempnam()
-   local temp = B.tempnam()
+   local none = B.tempid()
+   local temp = B.tempid()
    local iter = B.callExpression(B.identifier('pairs'), { self:get(node.right) })
    local left = self:get(node.left)
    local body = self:get(node.body)
@@ -537,7 +537,7 @@ function match:RawString(node)
    return B.listExpression('..', list)
 end
 function match:ArrayComprehension(node)
-   local temp = B.tempnam()
+   local temp = B.tempid()
    local body = B.blockStatement{
       B.localDeclaration({ temp }, {
          B.callExpression(
@@ -564,8 +564,8 @@ function match:ArrayComprehension(node)
    )
 end
 function match:ComprehensionBlock(node)
-   local none = B.tempnam()
-   local temp = B.tempnam()
+   local none = B.tempid()
+   local temp = B.tempid()
    local iter = B.callExpression(B.identifier('pairs'), { self:get(node.right) })
    local left = self:get(node.left)
    local body = { }
